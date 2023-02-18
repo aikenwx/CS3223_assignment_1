@@ -22,6 +22,18 @@
 
 #define INT_ACCESS_ONCE(var)	((int)(*((volatile int *)&(var))))
 
+#define NOT_IN_STACK -1
+
+/* A stack frame for LRU.
+ * NOTE: A stack frame is considered to not be part of 
+ * the stack iff both next and prev = NOT_IN_STACK
+ */
+typedef struct 
+{
+    int buf_id;
+    int next; 
+    int prev;
+} LruStackFrame;
 
 /*
  * The shared freelist control information.
@@ -32,9 +44,7 @@ typedef struct
 	slock_t		buffer_strategy_lock;
 
 	/*
-	 * Clock sweep hand: index of next buffer to consider grabbing. Note that
-	 * this isn't a concrete buffer - we only ever increase the value. So, to
-	 * get an actual buffer, it needs to be used modulo NBuffers.
+	 * Index of next buffer to consider grabbing. 
 	 */
 	pg_atomic_uint32 nextVictimBuffer;
 
@@ -45,8 +55,8 @@ typedef struct
 	 * NOTE: lastFreeBuffer is undefined when firstFreeBuffer is -1 (that is,
 	 * when the list is empty)
 	 */
-
-	/*
+	
+    /*
 	 * Statistics.  These counters should be wide enough that they can't
 	 * overflow during a single bgwriter cycle.
 	 */
@@ -58,6 +68,17 @@ typedef struct
 	 * StrategyNotifyBgWriter.
 	 */
 	int			bgwprocno;
+
+    int firstFrame; /* Index of the frame at the top of the stack */
+    int lastFrame; /* Index of the frame at the bottom of the stack */ 
+
+    /* 
+     * An unordered list containing all stack frames. 
+     * Each frame corresponds to a buf_id and vice-versa.
+     * NOTE: The actual order of the stack is determined 
+     *       by the next and prev of each frame
+     */
+    LruStackFrame stackFrames[FLEXIBLE_ARRAY_MEMBER];
 } BufferStrategyControl;
 
 /* Pointers to shared state */
@@ -96,7 +117,6 @@ typedef struct BufferAccessStrategyData
 	Buffer		buffers[FLEXIBLE_ARRAY_MEMBER];
 }			BufferAccessStrategyData;
 
-
 /* cs3223 */
 void StrategyUpdateAccessedBuffer(int buf_id, bool delete);
 
@@ -105,71 +125,6 @@ static BufferDesc *GetBufferFromRing(BufferAccessStrategy strategy,
 									 uint32 *buf_state);
 static void AddBufferToRing(BufferAccessStrategy strategy,
 							BufferDesc *buf);
-
-/*
- * ClockSweepTick - Helper routine for StrategyGetBuffer()
- *
- * Move the clock hand one buffer ahead of its current position and return the
- * id of the buffer now under the hand.
- */
-static inline uint32
-ClockSweepTick(void)
-{
-	uint32		victim;
-
-	/*
-	 * Atomically move hand ahead one buffer - if there's several processes
-	 * doing this, this can lead to buffers being returned slightly out of
-	 * apparent order.
-	 */
-	victim =
-		pg_atomic_fetch_add_u32(&StrategyControl->nextVictimBuffer, 1);
-
-	if (victim >= NBuffers)
-	{
-		uint32		originalVictim = victim;
-
-		/* always wrap what we look up in BufferDescriptors */
-		victim = victim % NBuffers;
-
-		/*
-		 * If we're the one that just caused a wraparound, force
-		 * completePasses to be incremented while holding the spinlock. We
-		 * need the spinlock so StrategySyncStart() can return a consistent
-		 * value consisting of nextVictimBuffer and completePasses.
-		 */
-		if (victim == 0)
-		{
-			uint32		expected;
-			uint32		wrapped;
-			bool		success = false;
-
-			expected = originalVictim + 1;
-
-			while (!success)
-			{
-				/*
-				 * Acquire the spinlock while increasing completePasses. That
-				 * allows other readers to read nextVictimBuffer and
-				 * completePasses in a consistent manner which is required for
-				 * StrategySyncStart().  In theory delaying the increment
-				 * could lead to an overflow of nextVictimBuffers, but that's
-				 * highly unlikely and wouldn't be particularly harmful.
-				 */
-				SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
-
-				wrapped = expected % NBuffers;
-
-				success = pg_atomic_compare_exchange_u32(&StrategyControl->nextVictimBuffer,
-														 &expected, wrapped);
-				if (success)
-					StrategyControl->completePasses++;
-				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
-			}
-		}
-	}
-	return victim;
-}
 
 /*
  * have_free_buffer -- a lockless check to see if there is a free buffer in
@@ -196,7 +151,111 @@ have_free_buffer(void)
 void
 StrategyUpdateAccessedBuffer(int buf_id, bool delete)
 {
-	elog(ERROR, "StrategyUpdateAccessedBuffer: Not implemented!");
+    Assert(buf_id >= 0 && buf_id < NBuffers);
+	if (delete) 
+    {
+        LruStackFrame toDelete = StrategyControl->stackFrames[buf_id];
+        if (buf_id == StrategyControl->firstFrame)
+        {
+            /* toDelete is first frame; second frame becomes first frame */
+            StrategyControl->firstFrame = toDelete.next;
+            StrategyControl->stackFrames[toDelete.next].prev = NOT_IN_STACK;
+        }
+        else if (buf_id == StrategyControl->lastFrame)
+        {
+            /* toDelete is last frame; second last frame becomes last frame */
+            StrategyControl->lastFrame = toDelete.prev;
+            StrategyControl->stackFrames[toDelete.prev].next = NOT_IN_STACK;
+        }
+        else 
+        {
+            /* toDelete is somewhere in the middle; update the surrounding frames */
+            StrategyControl->stackFrames[toDelete.next].prev = toDelete.next;
+            StrategyControl->stackFrames[toDelete.prev].next = toDelete.prev;
+        }
+        /* Remove toDelete from stack */
+        toDelete.prev = NOT_IN_STACK;
+        toDelete.next = NOT_IN_STACK;
+    }
+    else
+    { 
+        /* The frame corresponding to buffer buf_id*/
+        LruStackFrame *foundFrame;
+        bool isInStack = false;
+
+        /* Search for buf_id in stack (unless stack is empty) */
+        if(StrategyControl->firstFrame != NOT_IN_STACK)
+        {
+            int currFrame = StrategyControl->firstFrame;
+            while (currFrame >= 0 && currFrame < NBuffers)
+                {
+                    if (currFrame == buf_id)
+                    {   
+                        isInStack = true;
+                        foundFrame = &StrategyControl->stackFrames[currFrame];
+                        break;
+                    }
+                    else {
+                        /* Move to next frame in stack */
+                        currFrame = StrategyControl->stackFrames[currFrame].next;
+                    } 
+                }
+        }
+        if (isInStack)
+        {
+            /* (C1 or C3) Move frame to top of stack if not already on top */
+            if (StrategyControl->firstFrame == foundFrame->buf_id)
+            {
+                /* foundFrame is already on top; do nothing */
+                return;
+            }
+            else if (StrategyControl->lastFrame == foundFrame->buf_id)
+            {
+                /* foundFrame is at the bottom*/
+                /* Place foundFrame on top */
+                StrategyControl->stackFrames[StrategyControl->firstFrame].prev = foundFrame->buf_id;
+                foundFrame->next = StrategyControl->firstFrame; 
+                StrategyControl->firstFrame = foundFrame->buf_id;                
+               
+                /* Update bottom of stack */
+                StrategyControl->lastFrame = foundFrame->prev;
+                foundFrame->prev = NOT_IN_STACK;
+                StrategyControl->stackFrames[StrategyControl->lastFrame].next = NOT_IN_STACK;
+            }
+            else
+            {
+                /* foundFrame is somwhere in the middle*/
+                /* Place foundFrame on top */
+                StrategyControl->stackFrames[StrategyControl->firstFrame].prev = foundFrame->buf_id;
+                int oldNextFrame = foundFrame->next;
+                foundFrame->next = StrategyControl->firstFrame;
+                StrategyControl->firstFrame = foundFrame->buf_id;
+                
+                /* Update surrounding frames */
+                StrategyControl->stackFrames[oldNextFrame].prev = foundFrame->prev;
+                StrategyControl->stackFrames[foundFrame->prev].next = oldNextFrame;
+                foundFrame->prev = NOT_IN_STACK;
+            }
+        }
+        else 
+        {
+            /* (C2) Not in stack; add frame to top of stack */
+            StrategyControl->stackFrames[buf_id].next = StrategyControl->firstFrame;
+            StrategyControl->stackFrames[buf_id].prev = NOT_IN_STACK;
+            if (StrategyControl->firstFrame != NOT_IN_STACK)
+            {
+                /* Stack is nonempty; move first frame down */
+                StrategyControl->stackFrames[StrategyControl->firstFrame].prev = buf_id;
+                StrategyControl->firstFrame = buf_id;
+            }
+            else
+            {
+                /* Stack is empty; initialize stack */
+                StrategyControl->firstFrame = buf_id;
+                StrategyControl->lastFrame = buf_id;
+            }
+        }
+    }
 }
 
 
@@ -218,7 +277,6 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 {
 	BufferDesc *buf;
 	int			bgwprocno;
-	int			trycounter;
 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
 
 	/*
@@ -308,68 +366,50 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 
 			/*
-			 * If the buffer is pinned or has a nonzero usage_count, we cannot
+			 * If the buffer is pinned, we cannot
 			 * use it; discard it and retry.  (This can only happen if VACUUM
 			 * put a valid buffer in the freelist and then someone else used
 			 * it before we got to it.  It's probably impossible altogether as
 			 * of 8.3, but we'd better check anyway.)
 			 */
 			local_buf_state = LockBufHdr(buf);
-			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
-				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
 			{
+                /* We only need pin count = 0 for LRU */
 				if (strategy != NULL)
 					AddBufferToRing(strategy, buf);
-				*buf_state = local_buf_state;
+                /* Call update for case C2 */
+                StrategyUpdateAccessedBuffer(buf->buf_id, false);
+			    *buf_state = local_buf_state;
 				return buf;
 			}
 			UnlockBufHdr(buf, local_buf_state);
 		}
 	}
 
-	/* Nothing on the freelist, so run the "clock sweep" algorithm */
-	trycounter = NBuffers;
-	for (;;)
+	/* Nothing on the freelist, run LRU policy on stack */
+    int curr_buff_id = StrategyControl->lastFrame;
+	while (curr_buff_id >= 0 && curr_buff_id < NBuffers) 
 	{
-		buf = GetBufferDescriptor(ClockSweepTick());
-
-		/*
-		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
-		 * it; decrement the usage_count (unless pinned) and keep scanning.
-		 */
-		local_buf_state = LockBufHdr(buf);
-
+		buf = GetBufferDescriptor(curr_buff_id);
+    	local_buf_state = LockBufHdr(buf);
+        /* If unpinned, we can replace this buffer */
 		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
 		{
-			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
-			{
-				local_buf_state -= BUF_USAGECOUNT_ONE;
-
-				trycounter = NBuffers;
-			}
-			else
-			{
-				/* Found a usable buffer */
 				if (strategy != NULL)
+                {
 					AddBufferToRing(strategy, buf);
-				*buf_state = local_buf_state;
+                }
+                 /* Call update for case C3 */
+                StrategyUpdateAccessedBuffer(buf->buf_id, false);
+                *buf_state = local_buf_state;
 				return buf;
-			}
 		}
-		else if (--trycounter == 0)
-		{
-			/*
-			 * We've scanned all the buffers without making any state changes,
-			 * so all the buffers are pinned (or were when we looked at them).
-			 * We could hope that someone will free one eventually, but it's
-			 * probably better to fail than to risk getting stuck in an
-			 * infinite loop.
-			 */
-			UnlockBufHdr(buf, local_buf_state);
-			elog(ERROR, "no unpinned buffers available");
-		}
+        /* Buffer is pinned; go up the stack */
 		UnlockBufHdr(buf, local_buf_state);
+        curr_buff_id = StrategyControl->stackFrames[curr_buff_id].prev;
 	}
+    elog(ERROR, "no unpinned buffers available");	
 }
 
 /*
@@ -390,6 +430,8 @@ StrategyFreeBuffer(BufferDesc *buf)
 		if (buf->freeNext < 0)
 			StrategyControl->lastFreeBuffer = buf->buf_id;
 		StrategyControl->firstFreeBuffer = buf->buf_id;
+         /* Call update for case C4 */
+        StrategyUpdateAccessedBuffer(buf->buf_id, true);
 	}
 
 	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
@@ -476,6 +518,9 @@ StrategyShmemSize(void)
 	/* size of the shared replacement strategy control block */
 	size = add_size(size, MAXALIGN(sizeof(BufferStrategyControl)));
 
+    /* size of the lru stack equals number of frames times size of 1 frame */
+    size = add_size(size, mul_size(NBuffers, sizeof(LruStackFrame)));
+
 	return size;
 }
 
@@ -508,7 +553,8 @@ StrategyInitialize(bool init)
 	 */
 	StrategyControl = (BufferStrategyControl *)
 		ShmemInitStruct("Buffer Strategy Status",
-						sizeof(BufferStrategyControl),
+						offsetof(BufferStrategyControl, stackFrames) + 
+                            NBuffers * sizeof(LruStackFrame),
 						&found);
 
 	if (!found)
@@ -536,6 +582,15 @@ StrategyInitialize(bool init)
 
 		/* No pending notification */
 		StrategyControl->bgwprocno = -1;
+
+        /* Initialize stack */
+        StrategyControl->firstFrame = NOT_IN_STACK;
+        StrategyControl->lastFrame = NOT_IN_STACK;
+        
+        /* Initialize all stack frames */
+        for (int i = 0; i < NBuffers; ++i) {
+            StrategyControl->stackFrames[i] = (LruStackFrame) {i, NOT_IN_STACK, NOT_IN_STACK};
+        }
 	}
 	else
 		Assert(!init);
@@ -649,16 +704,11 @@ GetBufferFromRing(BufferAccessStrategy strategy, uint32 *buf_state)
 	/*
 	 * If the buffer is pinned we cannot use it under any circumstances.
 	 *
-	 * If usage_count is 0 or 1 then the buffer is fair game (we expect 1,
-	 * since our own previous usage of the ring element would have left it
-	 * there, but it might've been decremented by clock sweep since then). A
-	 * higher usage_count indicates someone else has touched the buffer, so we
-	 * shouldn't re-use it.
+	 * Usage count does not matter.
 	 */
 	buf = GetBufferDescriptor(bufnum - 1);
 	local_buf_state = LockBufHdr(buf);
-	if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
-		&& BUF_STATE_GET_USAGECOUNT(local_buf_state) <= 1)
+	if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
 	{
 		strategy->current_was_in_ring = true;
 		*buf_state = local_buf_state;
