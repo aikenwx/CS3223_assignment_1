@@ -152,96 +152,47 @@ void
 StrategyUpdateAccessedBuffer(int buf_id, bool delete)
 {
     Assert(buf_id >= 0 && buf_id < NBuffers);
-	if (delete) 
+    if (delete) 
     {
-        LruStackFrame toDelete = StrategyControl->stackFrames[buf_id];
+	    LruStackFrame *toDelete = &StrategyControl->stackFrames[buf_id];
         if (buf_id == StrategyControl->firstFrame)
         {
             /* toDelete is first frame; second frame becomes first frame */
-            StrategyControl->firstFrame = toDelete.next;
-            StrategyControl->stackFrames[toDelete.next].prev = NOT_IN_STACK;
+            StrategyControl->firstFrame = toDelete->next;
+            StrategyControl->stackFrames[toDelete->next].prev = NOT_IN_STACK;
         }
         else if (buf_id == StrategyControl->lastFrame)
         {
             /* toDelete is last frame; second last frame becomes last frame */
-            StrategyControl->lastFrame = toDelete.prev;
-            StrategyControl->stackFrames[toDelete.prev].next = NOT_IN_STACK;
+            StrategyControl->lastFrame = toDelete->prev;
+            StrategyControl->stackFrames[toDelete->prev].next = NOT_IN_STACK;
         }
         else 
         {
             /* toDelete is somewhere in the middle; update the surrounding frames */
-            StrategyControl->stackFrames[toDelete.next].prev = toDelete.next;
-            StrategyControl->stackFrames[toDelete.prev].next = toDelete.prev;
+            StrategyControl->stackFrames[toDelete->next].prev = toDelete->prev;
+            StrategyControl->stackFrames[toDelete->prev].next = toDelete->next;
         }
+
         /* Remove toDelete from stack */
-        toDelete.prev = NOT_IN_STACK;
-        toDelete.next = NOT_IN_STACK;
+        toDelete->prev = NOT_IN_STACK;
+        toDelete->next = NOT_IN_STACK;
     }
     else
     { 
+        if (StrategyControl->firstFrame == buf_id)
+        {
+            /* (C1a) Frame of buffer being accessed is already on top */
+            return;
+        }
         /* The frame corresponding to buffer buf_id*/
-        LruStackFrame *foundFrame;
-        bool isInStack = false;
-
-        /* Search for buf_id in stack (unless stack is empty) */
-        if(StrategyControl->firstFrame != NOT_IN_STACK)
-        {
-            int currFrame = StrategyControl->firstFrame;
-            while (currFrame >= 0 && currFrame < NBuffers)
-                {
-                    if (currFrame == buf_id)
-                    {   
-                        isInStack = true;
-                        foundFrame = &StrategyControl->stackFrames[currFrame];
-                        break;
-                    }
-                    else {
-                        /* Move to next frame in stack */
-                        currFrame = StrategyControl->stackFrames[currFrame].next;
-                    } 
-                }
-        }
-        if (isInStack)
-        {
-            /* (C1 or C3) Move frame to top of stack if not already on top */
-            if (StrategyControl->firstFrame == foundFrame->buf_id)
-            {
-                /* foundFrame is already on top; do nothing */
-                return;
-            }
-            else if (StrategyControl->lastFrame == foundFrame->buf_id)
-            {
-                /* foundFrame is at the bottom*/
-                /* Place foundFrame on top */
-                StrategyControl->stackFrames[StrategyControl->firstFrame].prev = foundFrame->buf_id;
-                foundFrame->next = StrategyControl->firstFrame; 
-                StrategyControl->firstFrame = foundFrame->buf_id;                
-               
-                /* Update bottom of stack */
-                StrategyControl->lastFrame = foundFrame->prev;
-                foundFrame->prev = NOT_IN_STACK;
-                StrategyControl->stackFrames[StrategyControl->lastFrame].next = NOT_IN_STACK;
-            }
-            else
-            {
-                /* foundFrame is somwhere in the middle*/
-                /* Place foundFrame on top */
-                StrategyControl->stackFrames[StrategyControl->firstFrame].prev = foundFrame->buf_id;
-                int oldNextFrame = foundFrame->next;
-                foundFrame->next = StrategyControl->firstFrame;
-                StrategyControl->firstFrame = foundFrame->buf_id;
-                
-                /* Update surrounding frames */
-                StrategyControl->stackFrames[oldNextFrame].prev = foundFrame->prev;
-                StrategyControl->stackFrames[foundFrame->prev].next = oldNextFrame;
-                foundFrame->prev = NOT_IN_STACK;
-            }
-        }
-        else 
+        LruStackFrame *bufFrame = &StrategyControl->stackFrames[buf_id];
+        
+        if (bufFrame->next == NOT_IN_STACK && bufFrame->prev == NOT_IN_STACK)
         {
             /* (C2) Not in stack; add frame to top of stack */
-            StrategyControl->stackFrames[buf_id].next = StrategyControl->firstFrame;
-            StrategyControl->stackFrames[buf_id].prev = NOT_IN_STACK;
+            bufFrame->next = StrategyControl->firstFrame;
+            bufFrame->prev = NOT_IN_STACK;
             if (StrategyControl->firstFrame != NOT_IN_STACK)
             {
                 /* Stack is nonempty; move first frame down */
@@ -253,6 +204,37 @@ StrategyUpdateAccessedBuffer(int buf_id, bool delete)
                 /* Stack is empty; initialize stack */
                 StrategyControl->firstFrame = buf_id;
                 StrategyControl->lastFrame = buf_id;
+            }
+        }
+        else
+        {
+            /* (C1b or C3) Buffer in stack; move frame to top of stack */
+            if (StrategyControl->lastFrame == bufFrame->buf_id)
+            {
+                /* bufFrame is at the bottom*/
+                /* Place bufFrame on top */
+                StrategyControl->stackFrames[StrategyControl->firstFrame].prev = bufFrame->buf_id;
+                bufFrame->next = StrategyControl->firstFrame; 
+                StrategyControl->firstFrame = bufFrame->buf_id;                
+               
+                /* Update bottom of stack */
+                StrategyControl->lastFrame = bufFrame->prev;
+                bufFrame->prev = NOT_IN_STACK;
+                StrategyControl->stackFrames[StrategyControl->lastFrame].next = NOT_IN_STACK;
+            }
+            else
+            {
+                /* bufFrame is somwhere in the middle*/
+                /* Place bufFrame on top */
+                StrategyControl->stackFrames[StrategyControl->firstFrame].prev = bufFrame->buf_id;
+                int oldNextFrame = bufFrame->next;
+                bufFrame->next = StrategyControl->firstFrame;
+                StrategyControl->firstFrame = bufFrame->buf_id;
+                
+                /* Update surrounding frames */
+                StrategyControl->stackFrames[oldNextFrame].prev = bufFrame->prev;
+                StrategyControl->stackFrames[bufFrame->prev].next = oldNextFrame;
+                bufFrame->prev = NOT_IN_STACK;
             }
         }
     }
@@ -366,11 +348,11 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 
 			/*
-			 * If the buffer is pinned, we cannot
-			 * use it; discard it and retry.  (This can only happen if VACUUM
-			 * put a valid buffer in the freelist and then someone else used
-			 * it before we got to it.  It's probably impossible altogether as
-			 * of 8.3, but we'd better check anyway.)
+			 * If the buffer is pinned, we cannot use it; discard it and retry.  
+             * (This can only happen if VACUUM put a valid buffer in the 
+             * freelist and then someone else used it before we got to it.
+             * It's probably impossible altogether as of 8.3, but we'd 
+             * better check anyway.)
 			 */
 			local_buf_state = LockBufHdr(buf);
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
@@ -389,7 +371,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 
 	/* Nothing on the freelist, run LRU policy on stack */
     int curr_buff_id = StrategyControl->lastFrame;
-	while (curr_buff_id >= 0 && curr_buff_id < NBuffers) 
+	while (curr_buff_id != NOT_IN_STACK) 
 	{
 		buf = GetBufferDescriptor(curr_buff_id);
     	local_buf_state = LockBufHdr(buf);
@@ -588,7 +570,7 @@ StrategyInitialize(bool init)
         StrategyControl->lastFrame = NOT_IN_STACK;
         
         /* Initialize all stack frames */
-        for (int i = 0; i < NBuffers; ++i) {
+        for (int i = 0; i < NBuffers; i++) {
             StrategyControl->stackFrames[i] = (LruStackFrame) {i, NOT_IN_STACK, NOT_IN_STACK};
         }
 	}
